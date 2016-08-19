@@ -14,7 +14,6 @@
 #include <hx/CFFI.h>
 #include <string.h>
 #include <stdio.h>
-#include <stdarg.h>
 #include <cstdlib>
 #include <assert.h>
 #include <math.h>
@@ -479,177 +478,6 @@ extern "C" {
 			return val;
 		}
 		
-		ogg_packet InitOggPacket(int &mPacketCount, unsigned char* aData, size_t aLength, bool aBOS, bool aEOS, int64_t aGranulepos)
-		{
-			ogg_packet packet;
-			packet.packet = aData;
-			packet.bytes = aLength;
-			packet.b_o_s = aBOS;
-			packet.e_o_s = aEOS;
-			packet.granulepos = aGranulepos;
-			packet.packetno = mPacketCount++;
-			return packet;
-		}
-		
-		class VorbisDecoder {
-		public:
-			// Vorbis decoder state
-			vorbis_info mVorbisInfo;
-			vorbis_comment mVorbisComment;
-			vorbis_dsp_state mVorbisDsp;
-			vorbis_block mVorbisBlock;
-			uint32_t mPacketCount;
-			uint32_t mChannels;
-			ogg_packet oggPacket;
-			
-			VorbisDecoder() {
-				resetPacketNumber();
-			}
-			
-			void resetPacketNumber() {
-				oggPacket.packetno = -1;
-			}
-
-			void preparePacket(unsigned char * data, const long size) {
-				oggPacket.packet = data;
-				oggPacket.bytes = size;
-				oggPacket.b_o_s = (oggPacket.packetno == -1);
-				oggPacket.e_o_s = false;
-				oggPacket.packetno++; 
-				oggPacket.granulepos = -1; 
-			}
-
-			int parseData(unsigned char * data, const long size, long long int time_ns, value decode_audio) {
-				int r;
-				preparePacket(data, size);
-				
-				if (oggPacket.bytes > 0) {
-					r = vorbis_synthesis(&mVorbisBlock, &oggPacket);
-					if (r < 0) {
-						fprintf(stderr, "vorbis_synthesis failed, error: %d\n", r);
-						return -1;
-					}
-					
-					r = vorbis_synthesis_blockin(&mVorbisDsp, &mVorbisBlock); 
-					if (r < 0) {
-						fprintf(stderr, "vorbis_synthesis failed, error: %d\n", r);
-						return -1;
-					}
-					
-					float **pcm = NULL;
-					int nsamples = 0;
-					
-					if ((nsamples = vorbis_synthesis_pcmout(&mVorbisDsp, &pcm)) > 0) {
-						int nchannels = 2;
-						buffer pcm_data = alloc_buffer_len(nsamples * nchannels * sizeof(float));
-						float *samples = (float *)buffer_data(pcm_data);
-						
-						for (int sample = 0; sample < nsamples; sample++) {
-							for (int channel = 0; channel < nchannels; channel++) {
-								float fval = pcm[channel][sample];
-								//short sval = (short)(fval * 32767);
-								*samples++ = fval;
-							}
-						}
-						
-						val_call2(decode_audio, alloc_float((double)(time_ns / 1000) / (double)(1000 * 1000)), buffer_val(pcm_data));
-						
-						//printf("%p: %d\n", pcm, samples);
-						vorbis_synthesis_read(&mVorbisDsp, nsamples);
-					}
-				}
-				
-				return 0;
-			}
-			
-			static uint64_t ne_xiph_lace_value(unsigned char ** np)
-			{
-			  uint64_t lace;
-			  uint64_t value;
-			  unsigned char * p = *np;
-
-			  lace = *p++;
-			  value = lace;
-			  while (lace == 255) {
-				lace = *p++;
-				value += lace;
-			  }
-
-			  *np = p;
-
-			  return value;
-			}
-
-			// https://groups.google.com/a/webmproject.org/group/webm-discuss/tree/browse_frm/month/2010-09/be9ab6c87fb2bca2?rnum=41&_done=%2Fa%2Fwebmproject.org%2Fgroup%2Fwebm-discuss%2Fbrowse_frm%2Fmonth%2F2010-09%3F
-			int parseHeader(unsigned char * data, const long size) {
-				unsigned char * data_start = data;
-				int status; 
-
-				vorbis_info_init(&mVorbisInfo); 
-				vorbis_comment_init(&mVorbisComment); 
-				memset(&mVorbisDsp, 0, sizeof(mVorbisDsp)); 
-				memset(&mVorbisBlock, 0, sizeof(mVorbisBlock)); 
-				
-				int packetCount = *data++ + 1;
-				if (packetCount > 3) {
-					fprintf(stderr, "packetCount > 3: %d\n", packetCount);
-					return -1;
-				}
-				
-				//printf("vorbis.parseHeader.packetCount: %d\n", packetCount);
-				
-				int lengths[3] = {0};
-				int total = 0;
-
-				for (int header_num = 0; header_num < packetCount - 1; header_num++) {
-					int length = ne_xiph_lace_value(&data);
-					total += length;
-					lengths[header_num] = length;
-				}
-				
-				lengths[2] = size - total;
-				
-				for (int header_num = 0; header_num < packetCount; header_num++) {
-					//printf("  packer header[%d]: %d\n", header_num, lengths[header_num]);
-				}
-				
-
-				for (int header_num = 0; header_num < packetCount; header_num++) {
-					uint64_t psize = lengths[header_num];
-					unsigned char * pdata = data;
-					preparePacket(pdata, psize);
-					data += psize;
-					
-					//printf("  packet: %p, %d\n", pdata, psize);
-					//for (int m = 0; m < psize; m++) printf("%02X ", (unsigned char)pdata[m]);
-					//printf("\n");
-
-					assert(oggPacket.packetno == header_num);
-					status = vorbis_synthesis_headerin(&mVorbisInfo, &mVorbisComment, &oggPacket); 
-					if (status < 0) {
-						fprintf(stderr, "vorbis_synthesis_headerin failed(%d), error: %d\n", header_num, status);
-						return -1;
-					}
-				}
-			
-				printf("Vorbis: version:%d, channels:%d, rate:%ld\n", mVorbisInfo.version, mVorbisInfo.channels, mVorbisInfo.rate);
-				
-				status = vorbis_synthesis_init(&mVorbisDsp, &mVorbisInfo); 
-				if (status < 0) {
-					fprintf(stderr, "vorbis_synthesis_init failed, error: %d\n", status);
-					return -1;
-				}
-				
-				status = vorbis_block_init(&mVorbisDsp, &mVorbisBlock); 
-				if (status < 0) {
-					fprintf(stderr, "vorbis_block_init failed, error: %d\n", status);
-					return -1;
-				}
-				
-				return 0;
-			}
-		};
-		
 		// http://dxr.mozilla.org/mozilla-central/content/media/webm/nsWebMReader.h.html
 		class MkvProcessor {
 		public:
@@ -665,7 +493,6 @@ extern "C" {
 			int width, height;
 			double frameRate;
 			double duration_sec;
-			VorbisDecoder *vorbisDecoder;
 			
 			MkvProcessor(IoMkvReader *reader) {
 				//printf("MkvProcessor\n"); fflush(stdout);
@@ -681,7 +508,6 @@ extern "C" {
 				this->height = 0;
 				this->frameRate = 30;
 				this->duration_sec = 0;
-				this->vorbisDecoder = new VorbisDecoder();
 			}
 			
 			~MkvProcessor() {
@@ -831,19 +657,6 @@ extern "C" {
 						printf("\t\tVideo Height\t\t: %d\n", this->height);
 						printf("\t\tVideo Rate\t\t: %f\n", (float)this->frameRate);
 					}
-
-					if (trackType == mkvparser::Track::kAudio) {
-						const AudioTrack* const pAudioTrack = static_cast<const AudioTrack*>(pTrack);
-						size_t privateDataSize = 0;
-						unsigned char *privateDataPointer = (unsigned char *)pAudioTrack->GetCodecPrivate(privateDataSize);
-
-						printf("\t\tAudio Channels\t\t: %lld\n", pAudioTrack->GetChannels());
-						printf("\t\tAudio BitDepth\t\t: %lld\n", pAudioTrack->GetBitDepth());
-						printf("\t\tAudio Sample Rate\t: %.3f\n", pAudioTrack->GetSamplingRate());
-						printf("\t\tAudio Private Data\t: %p, %ld\n", privateDataPointer, privateDataSize);
-						
-						this->vorbisDecoder->parseHeader(privateDataPointer, privateDataSize);
-					}
 				}
 
 				printf("\n\n\t\t\t   Cluster Info\n");
@@ -862,7 +675,7 @@ extern "C" {
 				return 0;
 			}
 			
-			int parseStep(value decode_video, value decode_audio) {
+			int parseStep(value decode_video) {
 				if (!this->hasMore) return 0;
 			
 				if (startCluster) {
@@ -927,8 +740,6 @@ extern "C" {
 							if (trackType == mkvparser::Track::kVideo) {
 								//printf("%lld\n", time_ns);
 								val_call2(decode_video, alloc_float((double)(time_ns / 1000) / (double)(1000 * 1000)), buffer_val(frame_data));
-							} else if (trackType == mkvparser::Track::kAudio) {
-								vorbisDecoder->parseData((unsigned char *)buffer_data(frame_data), buffer_size(frame_data), time_ns, decode_audio);
 							}
 #endif
 							
@@ -989,9 +800,9 @@ extern "C" {
 			return array;
 		}
 
-		DEFINE_FUNC_3(hx_webm_decoder_step, processor_value, decode_video_value, decode_audio_value) {
+		DEFINE_FUNC_2(hx_webm_decoder_step, processor_value, decode_video_value) {
 			MkvProcessor* processor = _get_MkvProcessor_from_value(processor_value);
-			processor->parseStep(decode_video_value, decode_audio_value);
+			processor->parseStep(decode_video_value);
 			//return alloc_bool(processor->hasMore());
 			return alloc_null();
 		}
